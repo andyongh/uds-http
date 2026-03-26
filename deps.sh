@@ -3,11 +3,13 @@ set -e
 
 echo "Ensuring required macOS dependencies are installed..."
 if command -v brew &> /dev/null; then
-  brew list libuv &>/dev/null || brew install libuv
+  # No longer need libuv
+  # brew list libuv &>/dev/null || brew install libuv
   brew list llhttp &>/dev/null || brew install llhttp
   brew list lz4 &>/dev/null || brew install lz4
+  echo "Dependencies installed via Homebrew."
 else
-  echo "Homebrew not found. Please assure libuv, llhttp, and lz4 are installed."
+  echo "Homebrew not found. Please assure llhttp, and lz4 are installed."
 fi
 
 mkdir -p src

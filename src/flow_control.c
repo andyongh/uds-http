@@ -5,21 +5,18 @@
 #define TOKENS_PER_MS   50    // 50,000 per second = 50 per ms
 
 static long tokens = BUCKET_CAPACITY;
-static uv_timer_t timer_req;
 
-static void on_timer(uv_timer_t *handle) {
-    (void)handle; // unused
-    // Refill tokens
-    tokens += TOKENS_PER_MS * 10; // since we run every 10ms
+static long long on_timer(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    (void)eventLoop; (void)id; (void)clientData;
+    tokens += TOKENS_PER_MS * 10;
     if (tokens > BUCKET_CAPACITY) {
         tokens = BUCKET_CAPACITY;
     }
+    return 10; // ae runs the timer again in 10ms
 }
 
-void flow_control_init(uv_loop_t *loop) {
-    uv_timer_init(loop, &timer_req);
-    // Periodically run every 10ms to refill bucket
-    uv_timer_start(&timer_req, on_timer, 10, 10);
+void flow_control_init(aeEventLoop *loop) {
+    aeCreateTimeEvent(loop, 10, on_timer, NULL, NULL);
 }
 
 bool flow_control_consume_token(void) {

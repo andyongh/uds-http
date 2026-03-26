@@ -1,67 +1,88 @@
-#include <uv.h>
+#include "ae.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+#include <errno.h>
 #include "http_server.h"
 #include "flow_control.h"
+#include "logging.h"
+#include "metrics.h"
 
 #define SOCKET_PATH "/tmp/http.sock"
 #define MAX_CONCURRENCY 1000
 
-uv_loop_t *loop;
-uv_pipe_t server_pipe;
-int active_connections = 0;
+aeEventLoop *loop;
+int server_fd;
 
-void on_new_connection(uv_stream_t *server, int status) {
-    if (status < 0) {
-        fprintf(stderr, "New connection error %s\n", uv_strerror(status));
+void on_accept(aeEventLoop *el, int fd, void *privdata, int mask) {
+    (void)el; (void)privdata; (void)mask;
+    struct sockaddr_un sock_client;
+    socklen_t client_len = sizeof(sock_client);
+    int cfd = accept(fd, (struct sockaddr*)&sock_client, &client_len);
+    if (cfd == -1) return;
+
+    if (g_metrics.active_connections >= MAX_CONCURRENCY) {
+        close(cfd);
         return;
     }
 
-    if (active_connections >= MAX_CONCURRENCY) {
-        // Here we could simply not accept() until we dip below limit
-        // But to properly refuse, we must accept and eagerly close.
-        uv_pipe_t *dummy = malloc(sizeof(uv_pipe_t));
-        uv_pipe_init(loop, dummy, 0);
-        if (uv_accept(server, (uv_stream_t*)dummy) == 0) {
-            uv_close((uv_handle_t*)dummy, (uv_close_cb)free);
-        } else {
-            free(dummy);
-        }
-        return;
-    }
+    // Set non-blocking
+    int flags = fcntl(cfd, F_GETFL, 0);
+    fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
 
-    // Accept real connection and hand it off to the http_server state machine
-    http_server_accept_connection(server);
+    http_server_accept_connection(el, cfd);
 }
 
 int main() {
-    loop = uv_default_loop();
+    metrics_init();
+    loop = aeCreateEventLoop(MAX_CONCURRENCY + 128);
+    if (!loop) {
+        log_error("Failed to create aeEventLoop");
+        return 1;
+    }
 
     // 1. Initialize Flow Control
     flow_control_init(loop);
 
     // 2. Setup Unix Domain Socket Server Pipe
-    uv_pipe_init(loop, &server_pipe, 0);
-
-    // Unlink old socket just in case
-    uv_fs_t req;
-    uv_fs_unlink(loop, &req, SOCKET_PATH, NULL);
-    uv_fs_req_cleanup(&req);
-
-    int r;
-    if ((r = uv_pipe_bind(&server_pipe, SOCKET_PATH))) {
-        fprintf(stderr, "Bind error %s\n", uv_err_name(r));
+    unlink(SOCKET_PATH);
+    server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        log_error("socket error: %s", strerror(errno));
         return 1;
     }
 
-    // Listen
-    if ((r = uv_listen((uv_stream_t*)&server_pipe, 128, on_new_connection))) {
-        fprintf(stderr, "Listen error %s\n", uv_err_name(r));
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_un saddr;
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sun_family = AF_UNIX;
+    strncpy(saddr.sun_path, SOCKET_PATH, sizeof(saddr.sun_path)-1);
+
+    if (bind(server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) == -1) {
+        log_error("bind error: %s", strerror(errno));
         return 1;
     }
 
-    printf("Server listening on Unix Socket: %s\n", SOCKET_PATH);
+    if (listen(server_fd, 511) == -1) {
+        log_error("listen error: %s", strerror(errno));
+        return 1;
+    }
+
+    if (aeCreateFileEvent(loop, server_fd, AE_READABLE, on_accept, NULL) == AE_ERR) {
+        log_error("Failed to create ae file event");
+        return 1;
+    }
+
+    log_info("Server listening on Unix Socket: %s", SOCKET_PATH);
 
     // 3. Start Event Loop
-    return uv_run(loop, UV_RUN_DEFAULT);
+    aeMain(loop);
+    aeDeleteEventLoop(loop);
+    return 0;
 }
